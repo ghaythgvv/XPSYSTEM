@@ -52,6 +52,8 @@ POINTS_PER_HOUR = 10
 POINTS_PER_VERIFY = 10
 POINTS_PER_REPORT = 10
 POINTS_PER_BUMP = 10
+BANNER_URL = os.environ.get("BANNER_URL", "").strip()  # optional: link to a banner image (only used if there is no banner.gif next to bot.py)
+BANNER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "banner.gif")  # animated ELITE banner shown under the leaderboard
 DISBOARD_ID = 302050872383242240  # the Disboard bot that answers /bump
 
 # ---------- DATABASE ----------
@@ -235,26 +237,64 @@ def fmt_time(seconds: int) -> str:
     return f"{h}h {m:02d}m"
 
 
-def build_embed(guild: discord.Guild) -> discord.Embed:
-    rows = ranked()[:TOP_N]
-    embed = discord.Embed(title=f"{em('crown')}STAFF LEADERBOARD", color=EMBED_COLOR)
+def bar(value: int, top: int, size: int = 8) -> str:
+    """Little progress bar relative to the leader."""
+    filled = round(size * value / top) if top else 0
+    return "\u25b0" * filled + "\u25b1" * (size - filled)
+
+
+def build_embed(guild: discord.Guild, banner: bool = False) -> discord.Embed:
+    all_rows = ranked()
+    rows = all_rows[:TOP_N]
+    embed = discord.Embed(
+        title=f"{em('crown')}STAFF LEADERBOARD",
+        description=(
+            "Earn points by staying active in voice, verifying members, resolving reports and bumping the server.\n"
+            f"`{POINTS_PER_HOUR} pts / hour in VC`  \u00b7  `{POINTS_PER_VERIFY} pts / verification`  \u00b7  "
+            f"`{POINTS_PER_REPORT} pts / report`  \u00b7  `{POINTS_PER_BUMP} pts / bump`\n\u200b"
+        ),
+        color=EMBED_COLOR,
+    )
 
     if not rows:
         embed.description = "*Nobody has any points yet.*\nJoin a voice channel and start earning!"
     else:
-        podium = "\n".join(
-            f"`#{i + 1}`  <@{uid}>  ·  **{p:,}** pts" for i, (uid, p, *_) in enumerate(rows[:3])
-        )
-        embed.add_field(name=f"{em('crown')}Top 3", value=podium, inline=False)
+        # podium: three big columns side by side
+        places = ["1st place", "2nd place", "3rd place"]
+        for i, (uid, p, vs, *_rest) in enumerate(rows[:3]):
+            embed.add_field(
+                name=f"{em('crown') if i == 0 else ''}{places[i]}",
+                value=f"<@{uid}>\n**{p:,}** pts\n`{fmt_time(vs)}` in voice",
+                inline=True,
+            )
+        # everyone else, with a bar showing how close they are to the leader
         if len(rows) > 3:
+            top = rows[0][1]
             rest = "\n".join(
-                f"`#{i + 4}`  <@{uid}>  ·  {p:,} pts" for i, (uid, p, *_) in enumerate(rows[3:])
+                f"`#{i + 4:>2}`  <@{uid}>  `{bar(p, top)}`  **{p:,}** pts"
+                for i, (uid, p, *_r) in enumerate(rows[3:])
             )
             embed.add_field(name=f"{em('spark')}Rankings", value=rest, inline=False)
 
+        # team totals
+        embed.add_field(
+            name=f"{em('hourglass')}Team totals",
+            value=(
+                f"`{len(all_rows)}` staff  \u00b7  `{sum(r[1] for r in all_rows):,}` pts  \u00b7  "
+                f"`{fmt_time(sum(r[2] for r in all_rows))}` in voice\n"
+                f"`{sum(r[3] for r in all_rows)}` verifications  \u00b7  `{sum(r[4] for r in all_rows)}` reports  \u00b7  "
+                f"`{sum(r[5] for r in all_rows)}` bumps"
+            ),
+            inline=False,
+        )
+
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
-    embed.set_footer(text="Updates every minute  ·  Press the button to see your own stats")
+    if banner:
+        embed.set_image(url="attachment://banner.gif")  # the banner.gif sent together with the panel
+    elif BANNER_URL:
+        embed.set_image(url=BANNER_URL)
+    embed.set_footer(text="Updates every minute  \u00b7  Press the button to see your own stats")
     embed.timestamp = discord.utils.utcnow()
     return embed
 
@@ -323,7 +363,7 @@ async def update_leaderboard():
     if channel is None:
         return
     try:
-        await channel.get_partial_message(msg_id).edit(embed=build_embed(channel.guild))
+        await channel.get_partial_message(msg_id).edit(embed=build_embed(channel.guild, banner=bool(get_setting("lb_banner"))))
     except discord.NotFound:
         pass  # panel was deleted; run /setup_leaderboard again
     except discord.HTTPException as e:
@@ -351,11 +391,14 @@ async def setup_leaderboard(interaction: discord.Interaction):
         return await interaction.followup.send(
             "I need **View Channel**, **Send Messages** and **Embed Links** in this channel.", ephemeral=True)
     try:
-        msg = await interaction.channel.send(embed=build_embed(interaction.guild), view=StatsView())
+        has_banner = os.path.exists(BANNER_FILE)
+        kwargs = {"file": discord.File(BANNER_FILE, filename="banner.gif")} if has_banner else {}
+        msg = await interaction.channel.send(embed=build_embed(interaction.guild, banner=has_banner), view=StatsView(), **kwargs)
     except discord.HTTPException as e:
         return await interaction.followup.send(f"Couldn't post the panel: {e}", ephemeral=True)
     set_setting("lb_channel", interaction.channel.id)
     set_setting("lb_message", msg.id)
+    set_setting("lb_banner", 1 if has_banner else 0)
     await interaction.followup.send("Panel created.", ephemeral=True)
 
 
