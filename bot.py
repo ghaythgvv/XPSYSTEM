@@ -286,7 +286,7 @@ async def _lb_err(error):
 
 
 # ---------- COMMANDS ----------
-@bot.tree.command(name="setup_leaderboard", description="Post the live leaderboard panel here")
+@bot.tree.command(name="xp_leaderboard", description="Post the live leaderboard panel here")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def setup_leaderboard(interaction: discord.Interaction):
@@ -371,7 +371,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     await handle_message(msg)
 
 
-@bot.tree.command(name="points", description="Check your (or someone's) points")
+@bot.tree.command(name="xp_points", description="Check your (or someone's) points")
 @app_commands.guild_only()
 async def points_cmd(interaction: discord.Interaction, member: discord.Member = None):
     member = member or interaction.user
