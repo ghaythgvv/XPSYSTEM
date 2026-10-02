@@ -15,7 +15,10 @@ if _missing:
     raise SystemExit(1)
 
 # ---------- CONFIG (set these as environment variables) ----------
-TOKEN = os.environ["DISCORD_TOKEN"]
+# IMPORTANT: this bot needs its OWN Discord application + token. If DISCORD_TOKEN
+# belongs to another bot (e.g. ELT Music), the two bots overwrite each other's
+# slash commands and this one never receives them ("The application did not respond").
+TOKEN = os.environ["DISCORD_TOKEN"].strip()
 STAFF_ROLE_IDS = {int(x) for x in os.environ["STAFF_ROLE_IDS"].split(",") if x.strip()}  # comma-separated role IDs that earn points
 VERIFY_CHANNEL_ID = int(os.environ["VERIFY_CHANNEL_ID"])  # channel where the verification bot posts
 REPORT_CHANNEL_ID = int(os.environ["REPORT_CHANNEL_ID"])  # channel where the report bot posts
@@ -92,8 +95,12 @@ class Bot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        await self.tree.sync()
         self.add_view(StatsView())
+        try:
+            synced = await self.tree.sync()
+            print(f"Synced {len(synced)} slash command(s): {[c.name for c in synced]}", flush=True)
+        except Exception:
+            traceback.print_exc()
         voice_tick.start()
         update_leaderboard.start()
 
@@ -107,15 +114,19 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     if isinstance(error, app_commands.CheckFailure):
         return  # already answered by the check
     msg = "Something went wrong, please try again."
-    if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
-    else:
-        await interaction.response.send_message(msg, ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} in {len(bot.guilds)} server(s)", flush=True)
+    print(f"Logged in as {bot.user} (ID: {bot.user.id}) in {len(bot.guilds)} server(s)", flush=True)
+    print("If this name is NOT this bot's own name, DISCORD_TOKEN belongs to a different bot!", flush=True)
 
 
 def is_staff(member: discord.Member) -> bool:
@@ -143,6 +154,16 @@ async def voice_tick():
             for m in vc.members:
                 if not m.bot and is_staff(m) and not m.voice.self_deaf:
                     add(m.id, "voice_seconds", 60)
+
+
+@voice_tick.before_loop
+async def _voice_wait():
+    await bot.wait_until_ready()
+
+
+@voice_tick.error
+async def _voice_err(error):
+    traceback.print_exception(type(error), error, error.__traceback__)
 
 
 # ---------- LEADERBOARD PANEL ----------
@@ -229,10 +250,13 @@ class StatsView(discord.ui.View):
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         traceback.print_exception(type(error), error, error.__traceback__)
         msg = "Something went wrong, please try again."
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 
 @tasks.loop(minutes=1)
@@ -247,16 +271,37 @@ async def update_leaderboard():
         await channel.get_partial_message(msg_id).edit(embed=build_embed(channel.guild))
     except discord.NotFound:
         pass  # panel was deleted; run /setup_leaderboard again
+    except discord.HTTPException as e:
+        print(f"Couldn't update leaderboard: {e}", flush=True)
+
+
+@update_leaderboard.before_loop
+async def _lb_wait():
+    await bot.wait_until_ready()
+
+
+@update_leaderboard.error
+async def _lb_err(error):
+    traceback.print_exception(type(error), error, error.__traceback__)
 
 
 # ---------- COMMANDS ----------
 @bot.tree.command(name="setup_leaderboard", description="Post the live leaderboard panel here")
 @app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
 async def setup_leaderboard(interaction: discord.Interaction):
-    await interaction.response.send_message("Panel created ✅", ephemeral=True)
-    msg = await interaction.channel.send(embed=build_embed(interaction.guild), view=StatsView())
+    await interaction.response.defer(ephemeral=True)  # answer within 3s no matter what
+    perms = interaction.channel.permissions_for(interaction.guild.me)
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        return await interaction.followup.send(
+            "❌ I need **View Channel**, **Send Messages** and **Embed Links** in this channel.", ephemeral=True)
+    try:
+        msg = await interaction.channel.send(embed=build_embed(interaction.guild), view=StatsView())
+    except discord.HTTPException as e:
+        return await interaction.followup.send(f"❌ Couldn't post the panel: {e}", ephemeral=True)
     set_setting("lb_channel", interaction.channel.id)
     set_setting("lb_message", msg.id)
+    await interaction.followup.send("Panel created ✅", ephemeral=True)
 
 
 # ---------- WATCH THE VERIFICATION / REPORT BOTS ----------
@@ -264,7 +309,7 @@ MENTION = re.compile(r"<@!?(\d+)>")
 
 
 async def handle_message(msg: discord.Message):
-    if not msg.embeds:
+    if not msg.embeds or msg.guild is None:
         return
     fields = {f.name.strip().lower(): f.value for f in msg.embeds[0].fields}
 
@@ -317,6 +362,8 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     if payload.channel_id not in (VERIFY_CHANNEL_ID, REPORT_CHANNEL_ID):
         return
     channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        return
     try:
         msg = await channel.fetch_message(payload.message_id)
     except discord.HTTPException:
@@ -325,6 +372,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 
 
 @bot.tree.command(name="points", description="Check your (or someone's) points")
+@app_commands.guild_only()
 async def points_cmd(interaction: discord.Interaction, member: discord.Member = None):
     member = member or interaction.user
     row = db.execute("SELECT voice_seconds, verifications, reports FROM staff WHERE user_id = ?",
