@@ -23,6 +23,8 @@ TOKEN = os.environ["DISCORD_TOKEN"].strip()
 STAFF_ROLE_IDS = {int(x) for x in os.environ["STAFF_ROLE_IDS"].split(",") if x.strip()}  # comma-separated role IDs that earn points
 VERIFY_CHANNEL_ID = int(os.environ["VERIFY_CHANNEL_ID"])  # channel where the verification bot posts
 REPORT_CHANNEL_ID = int(os.environ["REPORT_CHANNEL_ID"])  # channel where the report bot posts
+ADMIN_ROLE_IDS = {int(x) for x in os.environ.get("ADMIN_ROLE_IDS", "").split(",") if x.strip()}  # high-rank roles (optional; server Administrators always count)
+PUNISH_CHANNEL_ID = int(os.environ.get("PUNISH_CHANNEL_ID") or 0)  # channel where the punishment bot posts its cards
 
 
 def pick_db_path() -> str:
@@ -48,10 +50,12 @@ def pick_db_path() -> str:
 
 DB_PATH = pick_db_path()
 TOP_N = 10
+PAGE_SIZE = 10
 POINTS_PER_HOUR = 10
 POINTS_PER_VERIFY = 10
 POINTS_PER_REPORT = 10
 POINTS_PER_BUMP = 10
+POINTS_PER_PUNISH = 10  # /warn /ban /kick /timeout /unwarn
 BANNER_URL = os.environ.get("BANNER_URL", "").strip()  # optional: link to a banner image (only used if there is no banner.gif next to bot.py)
 BANNER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "banner.gif")  # animated ELITE banner shown under the leaderboard
 DISBOARD_ID = 302050872383242240  # the Disboard bot that answers /bump
@@ -63,17 +67,22 @@ db.execute("""CREATE TABLE IF NOT EXISTS staff (
     voice_seconds INTEGER DEFAULT 0,
     verifications INTEGER DEFAULT 0,
     reports INTEGER DEFAULT 0)""")
-try:
-    db.execute("ALTER TABLE staff ADD COLUMN bumps INTEGER DEFAULT 0")  # adds the column to an existing database
-    db.commit()
-except sqlite3.OperationalError:
-    pass  # already there
+for _col in ("bumps", "punishments"):
+    try:
+        db.execute(f"ALTER TABLE staff ADD COLUMN {_col} INTEGER DEFAULT 0")  # adds the column to an existing database
+        db.commit()
+    except sqlite3.OperationalError:
+        pass  # already there
 db.execute("CREATE TABLE IF NOT EXISTS processed (message_id INTEGER, kind TEXT, PRIMARY KEY (message_id, kind))")
 db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value INTEGER)")
 db.commit()
 
+COLUMNS = {"voice_seconds", "verifications", "reports", "bumps", "punishments"}
+
 
 def add(user_id: int, column: str, amount: int):
+    if column not in COLUMNS:
+        raise ValueError(f"bad column {column}")
     db.execute("INSERT OR IGNORE INTO staff (user_id) VALUES (?)", (user_id,))
     db.execute(f"UPDATE staff SET {column} = {column} + ? WHERE user_id = ?", (amount, user_id))
     db.commit()
@@ -89,9 +98,9 @@ def set_setting(key, value):
     db.commit()
 
 
-def points(voice_seconds, verifications, reports, bumps=0):
+def points(voice_seconds, verifications, reports, bumps=0, punishments=0):
     return (int(voice_seconds / 3600 * POINTS_PER_HOUR) + verifications * POINTS_PER_VERIFY
-            + reports * POINTS_PER_REPORT + bumps * POINTS_PER_BUMP)
+            + reports * POINTS_PER_REPORT + bumps * POINTS_PER_BUMP + punishments * POINTS_PER_PUNISH)
 
 
 # ---------- CUSTOM EMOJIS ----------
@@ -183,15 +192,25 @@ async def on_ready():
     print("If this name is NOT this bot's own name, DISCORD_TOKEN belongs to a different bot!", flush=True)
 
 
-def is_staff(member: discord.Member) -> bool:
-    return any(r.id in STAFF_ROLE_IDS for r in member.roles)
+def is_staff(member) -> bool:
+    roles = getattr(member, "roles", None)
+    if not roles:
+        return False
+    return any(r.id in STAFF_ROLE_IDS for r in roles)
 
 
-def staff_only():
+def is_admin(member) -> bool:
+    """High rank: server Administrator or one of ADMIN_ROLE_IDS."""
+    if not isinstance(member, discord.Member):
+        return False
+    return member.guild_permissions.administrator or any(r.id in ADMIN_ROLE_IDS for r in member.roles)
+
+
+def admin_only():
     async def check(interaction: discord.Interaction):
-        if is_staff(interaction.user):
+        if is_admin(interaction.user):
             return True
-        await interaction.response.send_message("Staff only.", ephemeral=True)
+        await interaction.response.send_message("High rank only.", ephemeral=True)
         return False
     return app_commands.check(check)
 
@@ -206,8 +225,11 @@ async def voice_tick():
             if vc == guild.afk_channel:
                 continue
             for m in vc.members:
-                if not m.bot and is_staff(m) and not m.voice.self_deaf:
-                    add(m.id, "voice_seconds", 60)
+                if m.bot or not is_staff(m) or m.voice is None:
+                    continue
+                if m.voice.self_deaf or m.voice.deaf:
+                    continue
+                add(m.id, "voice_seconds", 60)
 
 
 @voice_tick.before_loop
@@ -225,9 +247,9 @@ EMBED_COLOR = 0x8B5CF6
 
 
 def ranked():
-    """All staff sorted by points: (user_id, points, voice_seconds, verifications, reports, bumps)."""
-    rows = db.execute("SELECT user_id, voice_seconds, verifications, reports, bumps FROM staff").fetchall()
-    out = [(uid, points(vs, ver, rep, b), vs, ver, rep, b) for uid, vs, ver, rep, b in rows]
+    """All staff sorted by points: (user_id, points, voice_seconds, verifications, reports, bumps, punishments)."""
+    rows = db.execute("SELECT user_id, voice_seconds, verifications, reports, bumps, punishments FROM staff").fetchall()
+    out = [(uid, points(vs, ver, rep, b, pu), vs, ver, rep, b, pu) for uid, vs, ver, rep, b, pu in rows]
     out.sort(key=lambda r: r[1], reverse=True)
     return out
 
@@ -249,9 +271,10 @@ def build_embed(guild: discord.Guild, banner: bool = False) -> discord.Embed:
     embed = discord.Embed(
         title=f"{em('crown')}STAFF LEADERBOARD",
         description=(
-            "Earn points by staying active in voice, verifying members, resolving reports and bumping the server.\n"
+            "Earn points by staying active in voice, verifying members, resolving reports, bumping the server and punishing rule breakers.\n"
             f"`{POINTS_PER_HOUR} pts / hour in VC`  \u00b7  `{POINTS_PER_VERIFY} pts / verification`  \u00b7  "
-            f"`{POINTS_PER_REPORT} pts / report`  \u00b7  `{POINTS_PER_BUMP} pts / bump`\n\u200b"
+            f"`{POINTS_PER_REPORT} pts / report`  \u00b7  `{POINTS_PER_BUMP} pts / bump`  \u00b7  "
+            f"`{POINTS_PER_PUNISH} pts / punishment`\n\u200b"
         ),
         color=EMBED_COLOR,
     )
@@ -283,7 +306,7 @@ def build_embed(guild: discord.Guild, banner: bool = False) -> discord.Embed:
                 f"`{len(all_rows)}` staff  \u00b7  `{sum(r[1] for r in all_rows):,}` pts  \u00b7  "
                 f"`{fmt_time(sum(r[2] for r in all_rows))}` in voice\n"
                 f"`{sum(r[3] for r in all_rows)}` verifications  \u00b7  `{sum(r[4] for r in all_rows)}` reports  \u00b7  "
-                f"`{sum(r[5] for r in all_rows)}` bumps"
+                f"`{sum(r[5] for r in all_rows)}` bumps  \u00b7  `{sum(r[6] for r in all_rows)}` punishments"
             ),
             inline=False,
         )
@@ -303,10 +326,10 @@ def build_stats_embed(member: discord.Member) -> discord.Embed:
     rows = ranked()
     pos = next((i for i, r in enumerate(rows) if r[0] == member.id), None)
     if pos is None:
-        total, vs, ver, rep, bump = 0, 0, 0, 0, 0
+        total, vs, ver, rep, bump, pun = 0, 0, 0, 0, 0, 0
         rank_text = "Unranked"
     else:
-        _, total, vs, ver, rep, bump = rows[pos]
+        _, total, vs, ver, rep, bump, pun = rows[pos]
         rank_text = f"#{pos + 1} of {len(rows)}"
 
     embed = discord.Embed(title=f"{em('profile')}{member.display_name}'s Stats", color=EMBED_COLOR)
@@ -319,14 +342,63 @@ def build_stats_embed(member: discord.Member) -> discord.Embed:
     embed.add_field(name=f"{em('check')}Verifications", value=f"{ver}\n`{ver * POINTS_PER_VERIFY:,} pts`", inline=True)
     embed.add_field(name=f"{em('warn')}Reports", value=f"{rep}\n`{rep * POINTS_PER_REPORT:,} pts`", inline=True)
     embed.add_field(name=f"{em('bump')}Bumps", value=f"{bump}\n`{bump * POINTS_PER_BUMP:,} pts`", inline=True)
+    embed.add_field(name=f"{em('warn')}Punishments", value=f"{pun}\n`{pun * POINTS_PER_PUNISH:,} pts`", inline=True)
 
     if pos == 0:
-        embed.add_field(name=f"{em('hourglass')}Progress", value="You're **#1** — keep it up!", inline=False)
+        embed.add_field(name=f"{em('hourglass')}Progress", value="You're **#1** \u2014 keep it up!", inline=False)
     elif pos is not None:
         gap = rows[pos - 1][1] - total
         embed.add_field(name=f"{em('hourglass')}Progress", value=f"**{gap:,} pts** to reach **#{pos}**", inline=False)
-    embed.set_footer(text=f"1h in VC = {POINTS_PER_HOUR} pts  ·  verification = {POINTS_PER_VERIFY} pts  ·  report = {POINTS_PER_REPORT} pts  ·  bump = {POINTS_PER_BUMP} pts")
+    embed.set_footer(text=f"1h in VC = {POINTS_PER_HOUR} pts  \u00b7  verification / report / bump / punishment = {POINTS_PER_VERIFY} pts")
     return embed
+
+
+# ---------- FULL LEADERBOARD (high rank) ----------
+def build_full_embed(page: int) -> tuple[discord.Embed, int]:
+    rows = ranked()
+    pages = max(1, -(-len(rows) // PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    chunk = rows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+    embed = discord.Embed(title=f"{em('crown')}FULL STAFF LEADERBOARD", color=EMBED_COLOR)
+    if not chunk:
+        embed.description = "*Nobody has any points yet.*"
+    else:
+        lines = []
+        for i, (uid, p, vs, ver, rep, b, pu) in enumerate(chunk):
+            n = page * PAGE_SIZE + i + 1
+            lines.append(
+                f"`#{n:>2}`  <@{uid}>  **{p:,}** pts\n"
+                f"\u2003`{fmt_time(vs)}` VC  \u00b7  `{ver}` ver  \u00b7  `{rep}` rep  \u00b7  `{b}` bump  \u00b7  `{pu}` pun"
+            )
+        embed.description = "\n".join(lines)
+    embed.set_footer(text=f"Page {page + 1}/{pages}  \u00b7  {len(rows)} staff")
+    return embed, pages
+
+
+class FullBoardView(discord.ui.View):
+    def __init__(self, page: int = 0):
+        super().__init__(timeout=180)
+        self.page = page
+        self._sync()
+
+    def _sync(self):
+        _, pages = build_full_embed(self.page)
+        self.prev.disabled = self.page <= 0
+        self.next.disabled = self.page >= pages - 1
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary)
+    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        embed, _ = build_full_embed(self.page)
+        self._sync()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        embed, _ = build_full_embed(self.page)
+        self._sync()
+        await interaction.response.edit_message(embed=embed, view=self)
 
 
 class StatsView(discord.ui.View):
@@ -338,9 +410,16 @@ class StatsView(discord.ui.View):
 
     @discord.ui.button(label="My Stats", style=discord.ButtonStyle.primary, custom_id="lb:mystats")
     async def my_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_staff(interaction.user):
+        if not is_staff(interaction.user) and not is_admin(interaction.user):
             return await interaction.response.send_message("This is for staff members only.", ephemeral=True)
         await interaction.response.send_message(embed=build_stats_embed(interaction.user), ephemeral=True)
+
+    @discord.ui.button(label="Full Leaderboard", style=discord.ButtonStyle.secondary, custom_id="lb:full")
+    async def full_board(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            return await interaction.response.send_message("Only high rank can view the full leaderboard.", ephemeral=True)
+        embed, _ = build_full_embed(0)
+        await interaction.response.send_message(embed=embed, view=FullBoardView(0), ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         traceback.print_exception(type(error), error, error.__traceback__)
@@ -361,11 +440,14 @@ async def update_leaderboard():
         return
     channel = bot.get_channel(ch_id)
     if channel is None:
-        return
+        try:
+            channel = await bot.fetch_channel(ch_id)
+        except discord.HTTPException:
+            return
     try:
         await channel.get_partial_message(msg_id).edit(embed=build_embed(channel.guild, banner=bool(get_setting("lb_banner"))))
     except discord.NotFound:
-        pass  # panel was deleted; run /setup_leaderboard again
+        pass  # panel was deleted; run /xp_leaderboard again
     except discord.HTTPException as e:
         print(f"Couldn't update leaderboard: {e}", flush=True)
 
@@ -384,14 +466,15 @@ async def _lb_err(error):
 @bot.tree.command(name="xp_leaderboard", description="Post the live leaderboard panel here")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
+@admin_only()
 async def setup_leaderboard(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)  # answer within 3s no matter what
     perms = interaction.channel.permissions_for(interaction.guild.me)
     if not (perms.view_channel and perms.send_messages and perms.embed_links):
         return await interaction.followup.send(
             "I need **View Channel**, **Send Messages** and **Embed Links** in this channel.", ephemeral=True)
+    has_banner = os.path.exists(BANNER_FILE)
     try:
-        has_banner = os.path.exists(BANNER_FILE)
         kwargs = {"file": discord.File(BANNER_FILE, filename="banner.gif")} if has_banner else {}
         msg = await interaction.channel.send(embed=build_embed(interaction.guild, banner=has_banner), view=StatsView(), **kwargs)
     except discord.HTTPException as e:
@@ -402,7 +485,49 @@ async def setup_leaderboard(interaction: discord.Interaction):
     await interaction.followup.send("Panel created.", ephemeral=True)
 
 
-# ---------- WATCH THE VERIFICATION / REPORT BOTS ----------
+class ConfirmReset(discord.ui.View):
+    def __init__(self, admin_id: int, target: discord.Member = None):
+        super().__init__(timeout=60)
+        self.admin_id = admin_id
+        self.target = target
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("This isn't your confirmation.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm reset", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.target:
+            db.execute("DELETE FROM staff WHERE user_id = ?", (self.target.id,))
+            text = f"Reset all points for {self.target.mention}."
+        else:
+            db.execute("DELETE FROM staff")
+            text = "Reset points for **everyone**."
+        db.commit()
+        self.stop()
+        await interaction.response.edit_message(content=f"{text} The panel updates within a minute.", view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="Reset cancelled.", view=None)
+
+
+@bot.tree.command(name="xp_reset", description="High rank: reset points for one member, or everyone")
+@app_commands.describe(member="Leave empty to reset EVERYONE")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+@admin_only()
+async def xp_reset(interaction: discord.Interaction, member: discord.Member = None):
+    who = member.mention if member else "**EVERYONE**"
+    await interaction.response.send_message(
+        f"{em('warn')}Are you sure you want to reset the points of {who}? This can't be undone.",
+        view=ConfirmReset(interaction.user.id, member), ephemeral=True)
+
+
+# ---------- WATCH THE VERIFICATION / REPORT / PUNISHMENT BOTS ----------
 MENTION = re.compile(r"<@!?(\d+)>")
 
 
@@ -473,16 +598,50 @@ async def handle_bump(msg: discord.Message):
         add(member.id, "bumps", 1)
 
 
+async def handle_punish(msg: discord.Message):
+    """Punishment bot cards (/warn /ban /kick /timeout /unwarn) - the mod who ran the command gets points."""
+    if not PUNISH_CHANNEL_ID or msg.guild is None or msg.channel.id != PUNISH_CHANNEL_ID or not msg.author.bot:
+        return
+    staff_id = None
+    meta = getattr(msg, "interaction_metadata", None)
+    user = getattr(meta, "user", None) if meta else None
+    if user is None and getattr(msg, "interaction", None):
+        user = msg.interaction.user
+    if user is not None:
+        staff_id = user.id  # the person who typed the slash command
+    elif msg.embeds:
+        keys = ("moderator", "mod", "staff", "issued by", "by")
+        for f in msg.embeds[0].fields:
+            if any(k in f.name.lower() for k in keys):
+                m = MENTION.search(f.value)
+                if m:
+                    staff_id = int(m.group(1))
+                    break
+    if staff_id is None:
+        print(f"[PUNISH DEBUG] card found but couldn't tell who the mod is. "
+              f"fields={[(f.name, f.value) for f in msg.embeds[0].fields] if msg.embeds else None}", flush=True)
+        return
+    member = msg.guild.get_member(staff_id)
+    if member is None or not is_staff(member):
+        return
+    cur = db.execute("INSERT OR IGNORE INTO processed (message_id, kind) VALUES (?, ?)", (msg.id, "punish"))
+    db.commit()
+    if cur.rowcount:
+        add(staff_id, "punishments", 1)
+
+
 @bot.event
 async def on_message(msg: discord.Message):
     await handle_bump(msg)
+    await handle_punish(msg)
     await handle_message(msg)
 
 
 @bot.event
 async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     from_disboard = str((payload.data.get("author") or {}).get("id")) == str(DISBOARD_ID)
-    if payload.channel_id not in (VERIFY_CHANNEL_ID, REPORT_CHANNEL_ID) and not from_disboard:
+    watched = {VERIFY_CHANNEL_ID, REPORT_CHANNEL_ID, PUNISH_CHANNEL_ID}
+    if payload.channel_id not in watched and not from_disboard:
         return
     channel = bot.get_channel(payload.channel_id)
     if channel is None:
@@ -492,6 +651,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     except discord.HTTPException:
         return
     await handle_bump(msg)
+    await handle_punish(msg)
     await handle_message(msg)
 
 
@@ -499,11 +659,12 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 @app_commands.guild_only()
 async def points_cmd(interaction: discord.Interaction, member: discord.Member = None):
     member = member or interaction.user
-    row = db.execute("SELECT voice_seconds, verifications, reports, bumps FROM staff WHERE user_id = ?",
-                     (member.id,)).fetchone() or (0, 0, 0, 0)
+    row = db.execute("SELECT voice_seconds, verifications, reports, bumps, punishments FROM staff WHERE user_id = ?",
+                     (member.id,)).fetchone() or (0, 0, 0, 0, 0)
     await interaction.response.send_message(
         f"**{member.display_name}**: {points(*row):,} pts "
-        f"({em('speaker')}{fmt_time(row[0])} · {em('check')}{row[1]} · {em('warn')}{row[2]} · {em('bump')}{row[3]} bumps)", ephemeral=True)
+        f"({em('speaker')}{fmt_time(row[0])} \u00b7 {em('check')}{row[1]} \u00b7 {em('warn')}{row[2]} \u00b7 "
+        f"{em('bump')}{row[3]} bumps \u00b7 {em('warn')}{row[4]} punishments)", ephemeral=True)
 
 
 try:
@@ -511,7 +672,7 @@ try:
 except discord.PrivilegedIntentsRequired:
     if intents.message_content:
         print("WARNING: 'Message Content Intent' is OFF in the Developer Portal (Bot tab -> Privileged Gateway Intents). "
-              "Restarting without it: commands work, but verify / report / bump points will NOT be counted until you turn it on.",
+              "Restarting without it: commands work, but verify / report / bump / punishment points will NOT be counted until you turn it on.",
               flush=True)
         os.environ["NO_MESSAGE_CONTENT"] = "1"
         os.execv(sys.executable, [sys.executable] + sys.argv)
