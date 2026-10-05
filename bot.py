@@ -49,7 +49,7 @@ def pick_db_path() -> str:
 
 
 DB_PATH = pick_db_path()
-TOP_N = 10
+TOP_N = 15
 PAGE_SIZE = 10
 POINTS_PER_HOUR = 10
 POINTS_PER_VERIFY = 10
@@ -246,11 +246,20 @@ async def _voice_err(error):
 EMBED_COLOR = 0x8B5CF6
 
 
-def ranked():
-    """All staff sorted by points: (user_id, points, voice_seconds, verifications, reports, bumps, punishments)."""
-    rows = db.execute("SELECT user_id, voice_seconds, verifications, reports, bumps, punishments FROM staff").fetchall()
-    out = [(uid, points(vs, ver, rep, b, pu), vs, ver, rep, b, pu) for uid, vs, ver, rep, b, pu in rows]
-    out.sort(key=lambda r: r[1], reverse=True)
+def ranked(guild=None):
+    """Every CURRENT staff member (even with 0 pts), sorted by points:
+    (user_id, points, voice_seconds, verifications, reports, bumps, punishments)."""
+    data = {r[0]: r[1:] for r in db.execute(
+        "SELECT user_id, voice_seconds, verifications, reports, bumps, punishments FROM staff")}
+    if guild is not None:
+        ids = {m.id for m in guild.members if not m.bot and is_staff(m)}
+    else:
+        ids = set(data)
+    out = []
+    for uid in ids:
+        vs, ver, rep, b, pu = data.get(uid, (0, 0, 0, 0, 0))
+        out.append((uid, points(vs, ver, rep, b, pu), vs, ver, rep, b, pu))
+    out.sort(key=lambda r: (-r[1], -r[2], r[0]))
     return out
 
 
@@ -266,7 +275,7 @@ def bar(value: int, top: int, size: int = 8) -> str:
 
 
 def build_embed(guild: discord.Guild, banner: bool = False) -> discord.Embed:
-    all_rows = ranked()
+    all_rows = ranked(guild)
     rows = all_rows[:TOP_N]
     embed = discord.Embed(
         title=f"{em('crown')}STAFF LEADERBOARD",
@@ -323,7 +332,7 @@ def build_embed(guild: discord.Guild, banner: bool = False) -> discord.Embed:
 
 
 def build_stats_embed(member: discord.Member) -> discord.Embed:
-    rows = ranked()
+    rows = ranked(member.guild)
     pos = next((i for i, r in enumerate(rows) if r[0] == member.id), None)
     if pos is None:
         total, vs, ver, rep, bump, pun = 0, 0, 0, 0, 0, 0
@@ -354,8 +363,8 @@ def build_stats_embed(member: discord.Member) -> discord.Embed:
 
 
 # ---------- FULL LEADERBOARD (high rank) ----------
-def build_full_embed(page: int) -> tuple[discord.Embed, int]:
-    rows = ranked()
+def build_full_embed(page: int, guild=None) -> tuple[discord.Embed, int]:
+    rows = ranked(guild)
     pages = max(1, -(-len(rows) // PAGE_SIZE))
     page = max(0, min(page, pages - 1))
     chunk = rows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
@@ -376,27 +385,28 @@ def build_full_embed(page: int) -> tuple[discord.Embed, int]:
 
 
 class FullBoardView(discord.ui.View):
-    def __init__(self, page: int = 0):
+    def __init__(self, guild, page: int = 0):
         super().__init__(timeout=180)
+        self.guild = guild
         self.page = page
         self._sync()
 
     def _sync(self):
-        _, pages = build_full_embed(self.page)
+        _, pages = build_full_embed(self.page, self.guild)
         self.prev.disabled = self.page <= 0
         self.next.disabled = self.page >= pages - 1
 
     @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary)
     async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page -= 1
-        embed, _ = build_full_embed(self.page)
+        embed, _ = build_full_embed(self.page, self.guild)
         self._sync()
         await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page += 1
-        embed, _ = build_full_embed(self.page)
+        embed, _ = build_full_embed(self.page, self.guild)
         self._sync()
         await interaction.response.edit_message(embed=embed, view=self)
 
@@ -418,8 +428,8 @@ class StatsView(discord.ui.View):
     async def full_board(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction.user):
             return await interaction.response.send_message("Only high rank can view the full leaderboard.", ephemeral=True)
-        embed, _ = build_full_embed(0)
-        await interaction.response.send_message(embed=embed, view=FullBoardView(0), ephemeral=True)
+        embed, _ = build_full_embed(0, interaction.guild)
+        await interaction.response.send_message(embed=embed, view=FullBoardView(interaction.guild, 0), ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         traceback.print_exception(type(error), error, error.__traceback__)
