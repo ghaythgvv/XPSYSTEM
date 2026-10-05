@@ -190,6 +190,11 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id}) in {len(bot.guilds)} server(s)", flush=True)
     print("If this name is NOT this bot's own name, DISCORD_TOKEN belongs to a different bot!", flush=True)
+    print(f"Message Content Intent: {'ON' if intents.message_content else 'OFF -> verify/report/bump/punishment points will NOT count'}", flush=True)
+    for name, cid in (("VERIFY", VERIFY_CHANNEL_ID), ("REPORT", REPORT_CHANNEL_ID), ("PUNISH", PUNISH_CHANNEL_ID)):
+        ch = bot.get_channel(cid) if cid else None
+        print(f"{name}_CHANNEL_ID={cid} -> {('#' + ch.name) if ch else 'NOT SET or the bot cannot see this channel'}", flush=True)
+    print(f"Staff role IDs: {sorted(STAFF_ROLE_IDS)}", flush=True)
 
 
 def is_staff(member) -> bool:
@@ -549,6 +554,13 @@ async def handle_message(msg: discord.Message):
     if msg.channel.id == VERIFY_CHANNEL_ID:
         kind, column = "verify", "verifications"
         value = fields.get("verified")  # field the verify bot adds with the staff mention
+        if not value:
+            value = next((v for k, v in fields.items()
+                          if any(w in k for w in ("verified", "verifier", "staff", "moderator", "handled")) and MENTION.search(v)), None)
+        if not value:
+            print(f"[VERIFY DEBUG] embed in verify channel but no staff mention found. fields={dict(fields)} "
+                  f"description={msg.embeds[0].description!r}", flush=True)
+            return
     elif msg.channel.id == REPORT_CHANNEL_ID:
         kind, column = "report", "reports"
         status = fields.get("status", "")
@@ -633,6 +645,7 @@ async def handle_punish(msg: discord.Message):
         return
     member = msg.guild.get_member(staff_id)
     if member is None or not is_staff(member):
+        print(f"[PUNISH DEBUG] mod {staff_id} skipped: not in server cache or has no role from STAFF_ROLE_IDS", flush=True)
         return
     cur = db.execute("INSERT OR IGNORE INTO processed (message_id, kind) VALUES (?, ?)", (msg.id, "punish"))
     db.commit()
@@ -642,6 +655,9 @@ async def handle_punish(msg: discord.Message):
 
 @bot.event
 async def on_message(msg: discord.Message):
+    if msg.channel.id in (VERIFY_CHANNEL_ID, REPORT_CHANNEL_ID, PUNISH_CHANNEL_ID):
+        print(f"[SEEN] channel={msg.channel.id} from={msg.author} embeds={len(msg.embeds)} "
+              f"interaction_user={getattr(getattr(msg, 'interaction_metadata', None), 'user', None)}", flush=True)
     await handle_bump(msg)
     await handle_punish(msg)
     await handle_message(msg)
