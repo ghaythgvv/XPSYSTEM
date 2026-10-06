@@ -909,7 +909,7 @@ def handle_punish(msg):
     user = interaction_user(msg)
     if user is not None:
         staff_id = user.id
-    elif msg.embeds:
+    else:
         staff_id = (staff_from_keys(msg, ("punisher", "moderator", "issued", "staff", "responsible", "admin", "mod", "by"))
                     or staff_from_text(msg, ("punisher", "moderator", "issued by", "staff", "by")))
     if staff_id is None:
