@@ -25,6 +25,7 @@ VERIFY_CHANNEL_ID = int(os.environ["VERIFY_CHANNEL_ID"])  # channel where the ve
 REPORT_CHANNEL_ID = int(os.environ["REPORT_CHANNEL_ID"])  # channel where the report bot posts
 ADMIN_ROLE_IDS = {int(x) for x in os.environ.get("ADMIN_ROLE_IDS", "").split(",") if x.strip()}  # high-rank roles (optional; server Administrators always count)
 PUNISH_CHANNEL_ID = int(os.environ.get("PUNISH_CHANNEL_ID") or 0)  # channel where the punishment bot posts its cards
+BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID") or 0)  # private channel where the bot keeps DB backups
 
 
 def pick_db_path() -> str:
@@ -40,8 +41,8 @@ def pick_db_path() -> str:
                 os.makedirs(folder, exist_ok=True)
             open(path, "a").close()  # test that we can write here
             print(f"Saving data to: {path}", flush=True)
-            if path == "points.db" and vol:
-                print("WARNING: not on the volume, data will be lost on redeploy", flush=True)
+            if vol and not os.path.abspath(path).startswith(os.path.abspath(vol)):
+                print("WARNING: database is NOT on the Railway volume, XP will be lost on redeploy!", flush=True)
             return path
         except OSError as e:
             print(f"Can't use {path}: {e}", flush=True)
@@ -164,11 +165,87 @@ class Bot(discord.Client):
             print(f"Synced {len(synced)} slash command(s): {[c.name for c in synced]}", flush=True)
         except Exception:
             traceback.print_exc()
+        await restore_backup()
         voice_tick.start()
         update_leaderboard.start()
+        backup_db.start()
 
 
 bot = Bot()
+
+
+# ---------- BACKUP / RESTORE (XP can never be lost on redeploy) ----------
+_last_backup = None
+_restore_ok = True
+
+
+async def _backup_channel():
+    ch = bot.get_channel(BACKUP_CHANNEL_ID)
+    return ch or await bot.fetch_channel(BACKUP_CHANNEL_ID)
+
+
+async def restore_backup():
+    """If this is a brand-new empty database, load the newest backup from Discord."""
+    global _restore_ok
+    if get_setting("initialized") is not None:
+        return  # database already has data
+    if BACKUP_CHANNEL_ID:
+        try:
+            ch = await _backup_channel()
+            async for m in ch.history(limit=50):
+                att = next((a for a in m.attachments if a.filename == "points_backup.db"), None)
+                if m.author.id == bot.user.id and att:
+                    tmp = DB_PATH + ".restore"
+                    with open(tmp, "wb") as f:
+                        f.write(await att.read())
+                    src = sqlite3.connect(tmp)
+                    src.backup(db)
+                    src.close()
+                    os.remove(tmp)
+                    print("Restored XP from the latest Discord backup.", flush=True)
+                    break
+        except Exception:
+            traceback.print_exc()
+            _restore_ok = False  # don't start overwriting backups with an empty DB
+            return
+    set_setting("initialized", 1)
+
+
+@tasks.loop(minutes=5)
+async def backup_db():
+    global _last_backup
+    if not BACKUP_CHANNEL_ID or not _restore_ok:
+        return
+    snap = repr(db.execute("SELECT * FROM staff ORDER BY user_id").fetchall()) + \
+        repr(db.execute("SELECT * FROM settings ORDER BY key").fetchall())
+    if snap == _last_backup:
+        return  # nothing changed
+    ch = await _backup_channel()
+    tmp = DB_PATH + ".bak"
+    dst = sqlite3.connect(tmp)
+    db.backup(dst)
+    dst.close()
+    try:
+        await ch.send("XP database backup", file=discord.File(tmp, filename="points_backup.db"))
+    finally:
+        os.remove(tmp)
+    _last_backup = snap
+    old = [m async for m in ch.history(limit=50) if m.author.id == bot.user.id and m.attachments]
+    for m in old[5:]:  # keep only the 5 newest
+        try:
+            await m.delete()
+        except discord.HTTPException:
+            pass
+
+
+@backup_db.before_loop
+async def _backup_wait():
+    await bot.wait_until_ready()
+
+
+@backup_db.error
+async def _backup_err(error):
+    traceback.print_exception(type(error), error, error.__traceback__)
 
 
 @bot.tree.error
@@ -191,7 +268,7 @@ async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id}) in {len(bot.guilds)} server(s)", flush=True)
     print("If this name is NOT this bot's own name, DISCORD_TOKEN belongs to a different bot!", flush=True)
     print(f"Message Content Intent: {'ON' if intents.message_content else 'OFF -> verify/report/bump/punishment points will NOT count'}", flush=True)
-    for name, cid in (("VERIFY", VERIFY_CHANNEL_ID), ("REPORT", REPORT_CHANNEL_ID), ("PUNISH", PUNISH_CHANNEL_ID)):
+    for name, cid in (("VERIFY", VERIFY_CHANNEL_ID), ("REPORT", REPORT_CHANNEL_ID), ("PUNISH", PUNISH_CHANNEL_ID), ("BACKUP", BACKUP_CHANNEL_ID)):
         ch = bot.get_channel(cid) if cid else None
         print(f"{name}_CHANNEL_ID={cid} -> {('#' + ch.name) if ch else 'NOT SET or the bot cannot see this channel'}", flush=True)
     print(f"Staff role IDs: {sorted(STAFF_ROLE_IDS)}", flush=True)
